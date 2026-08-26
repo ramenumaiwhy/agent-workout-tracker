@@ -127,6 +127,15 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(conflict["error"]["code"], "IDEMPOTENCY_CONFLICT")
         self.assertEqual(len(self.rows("SELECT * FROM set_performances")), 1)
 
+    def test_equivalent_normalized_command_reuses_receipt(self) -> None:
+        self.register()
+        request_id = self.request_id()
+        first = self.add(request_id=request_id, weight=60)
+        replay = self.add(request_id=request_id, weight=60.0)
+
+        self.assertEqual(first, replay)
+        self.assertEqual(len(self.rows("SELECT * FROM set_performances")), 1)
+
     def test_identical_sets_with_new_requests_are_both_recorded(self) -> None:
         self.register()
         self.add()
@@ -226,16 +235,19 @@ class JournalTests(unittest.TestCase):
     def test_void_removes_set_from_context_and_progress(self) -> None:
         self.register()
         recorded = self.add()
+        request_id = self.request_id()
         self.journal.record(
             {"type": "void_set", "target_set_id": recorded["set_id"], "source_text": "今のを取り消し"},
-            self.request_id(),
+            request_id,
         )
 
         context = self.journal.get_training_context()
         progress = self.journal.get_progress("ベンチプレス")
+        request = self.rows("SELECT command_json FROM record_requests WHERE request_id = ?", (request_id,))[0]
         self.assertIsNone(context["current_training"])
         self.assertEqual(context["exercises"][0]["recent_trainings"], [])
         self.assertEqual(progress["points"], [])
+        self.assertEqual(json.loads(request["command_json"])["source_text"], "今のを取り消し")
 
     def test_context_has_current_set_ids_and_recent_trainings(self) -> None:
         self.register()

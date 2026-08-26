@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trainings (
 CREATE TABLE IF NOT EXISTS record_requests (
   request_id TEXT PRIMARY KEY,
   command_fingerprint TEXT NOT NULL,
+  command_json TEXT NOT NULL,
   receipt_json TEXT,
   received_at TEXT NOT NULL
 );
@@ -152,20 +153,86 @@ def parse_performed_at(value: Any, now: dt.datetime, field: str = "performed_at"
     return parsed, iso_seconds(parsed)
 
 
-def canonical_fingerprint(command: dict[str, Any]) -> str:
+def normalize_command(command: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
     if not isinstance(command, dict):
         raise CommandError("INVALID_VALUE", field="command")
+    command_type = command.get("type")
+    if not isinstance(command_type, str):
+        raise CommandError("MISSING_FIELD", field="type")
+    text = source_text(command)
+
+    if command_type == "add_set":
+        if "weight_kg" not in command:
+            raise CommandError("MISSING_FIELD", field="weight_kg")
+        if "reps" not in command:
+            raise CommandError("MISSING_FIELD", field="reps")
+        normalized: dict[str, Any] = {
+            "type": command_type,
+            "exercise": name_key(display_name(command.get("exercise"), "exercise")),
+            "weight_kg": parse_weight(command["weight_kg"]),
+            "reps": parse_reps(command["reps"]),
+            "source_text": text,
+        }
+        if "performed_at" in command:
+            normalized["performed_at"] = parse_performed_at(command["performed_at"], now)[1]
+        return normalized
+
+    if command_type == "correct_set":
+        changes = command.get("changes")
+        if not isinstance(changes, dict) or not changes:
+            raise CommandError("MISSING_FIELD", field="changes")
+        allowed = {"exercise", "weight_kg", "reps", "performed_at"}
+        if set(changes) - allowed:
+            raise CommandError("INVALID_VALUE", field="changes")
+        normalized_changes: dict[str, Any] = {}
+        if "exercise" in changes:
+            normalized_changes["exercise"] = name_key(display_name(changes["exercise"], "exercise"))
+        if "weight_kg" in changes:
+            normalized_changes["weight_kg"] = parse_weight(changes["weight_kg"])
+        if "reps" in changes:
+            normalized_changes["reps"] = parse_reps(changes["reps"])
+        if "performed_at" in changes:
+            normalized_changes["performed_at"] = parse_performed_at(changes["performed_at"], now)[1]
+        return {
+            "type": command_type,
+            "target_set_id": parse_set_id(command.get("target_set_id")),
+            "changes": normalized_changes,
+            "source_text": text,
+        }
+
+    if command_type == "void_set":
+        return {
+            "type": command_type,
+            "target_set_id": parse_set_id(command.get("target_set_id")),
+            "source_text": text,
+        }
+
+    if command_type == "register_exercise":
+        name = display_name(command.get("name"), "name")
+        aliases_value = command.get("aliases", [])
+        if not isinstance(aliases_value, list):
+            raise CommandError("INVALID_VALUE", field="aliases")
+        return {
+            "type": command_type,
+            "name": name,
+            "aliases": [display_name(alias, "aliases") for alias in aliases_value],
+            "source_text": text,
+        }
+
+    raise CommandError("INVALID_VALUE", field="type")
+
+
+def canonical_command_json(command: dict[str, Any]) -> str:
     try:
-        payload = json.dumps(
+        return json.dumps(
             command,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
-        ).encode("utf-8")
+        )
     except (TypeError, ValueError) as error:
         raise CommandError("INVALID_VALUE", field="command") from error
-    return hashlib.sha256(payload).hexdigest()
 
 
 class TrainingJournal:
@@ -206,16 +273,18 @@ class TrainingJournal:
     ) -> dict[str, Any]:
         if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100:
             return CommandError("INVALID_VALUE", field="request_id").receipt()
-        try:
-            fingerprint = canonical_fingerprint(command)
-        except CommandError as error:
-            return error.receipt()
-
         con = self._connect()
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             con.close()
             raise StorageUnavailable("clock must return an offset-aware datetime")
+        try:
+            command = normalize_command(command, now)
+            command_json = canonical_command_json(command)
+        except CommandError as error:
+            con.close()
+            return error.receipt()
+        fingerprint = hashlib.sha256(command_json.encode("utf-8")).hexdigest()
         reported_at = iso_seconds(now)
         try:
             con.execute("BEGIN IMMEDIATE")
@@ -231,10 +300,11 @@ class TrainingJournal:
 
             con.execute(
                 """
-                INSERT INTO record_requests(request_id, command_fingerprint, receipt_json, received_at)
-                VALUES (?, ?, NULL, ?)
+                INSERT INTO record_requests(
+                  request_id, command_fingerprint, command_json, receipt_json, received_at
+                ) VALUES (?, ?, ?, NULL, ?)
                 """,
-                (request_id, fingerprint, reported_at),
+                (request_id, fingerprint, command_json, reported_at),
             )
             try:
                 receipt = self._dispatch(con, command, request_id, now, reported_at)
@@ -266,19 +336,13 @@ class TrainingJournal:
         now: dt.datetime,
         reported_at: str,
     ) -> dict[str, Any]:
-        command_type = command.get("type")
-        if not isinstance(command_type, str):
-            raise CommandError("MISSING_FIELD", field="type")
         handlers = {
             "add_set": self._add_set,
             "correct_set": self._correct_set,
             "void_set": self._void_set,
             "register_exercise": self._register_exercise,
         }
-        handler = handlers.get(command_type)
-        if handler is None:
-            raise CommandError("INVALID_VALUE", field="type")
-        return handler(con, command, request_id, now, reported_at)
+        return handlers[command["type"]](con, command, request_id, now, reported_at)
 
     def _exercise_by_name(self, con: sqlite3.Connection, value: Any) -> sqlite3.Row:
         display = display_name(value, "exercise")
@@ -310,12 +374,8 @@ class TrainingJournal:
         reported_at: str,
     ) -> dict[str, Any]:
         del request_id, now
-        source_text(command)
-        name = display_name(command.get("name"), "name")
-        aliases_value = command.get("aliases", [])
-        if not isinstance(aliases_value, list):
-            raise CommandError("INVALID_VALUE", field="aliases")
-        aliases = [display_name(alias, "aliases") for alias in aliases_value]
+        name = command["name"]
+        aliases = command["aliases"]
         keys = [name_key(name), *(name_key(alias) for alias in aliases)]
         if len(set(keys)) != len(keys):
             raise CommandError("EXERCISE_CONFLICT", field="aliases")
@@ -353,16 +413,12 @@ class TrainingJournal:
         now: dt.datetime,
         reported_at: str,
     ) -> dict[str, Any]:
-        text = source_text(command)
-        exercise = self._exercise_by_name(con, command.get("exercise"))
-        if "weight_kg" not in command:
-            raise CommandError("MISSING_FIELD", field="weight_kg")
-        if "reps" not in command:
-            raise CommandError("MISSING_FIELD", field="reps")
-        weight = parse_weight(command["weight_kg"])
-        reps = parse_reps(command["reps"])
+        text = command["source_text"]
+        exercise = self._exercise_by_name(con, command["exercise"])
+        weight = command["weight_kg"]
+        reps = command["reps"]
         performed, performed_at = parse_performed_at(command.get("performed_at"), now)
-        training_id = self._training_for(con, performed, now=reported_at)
+        training_id = self._training_for(con, performed, created_at=reported_at)
         cursor = con.execute(
             """
             INSERT INTO set_performances(
@@ -382,41 +438,20 @@ class TrainingJournal:
         now: dt.datetime,
         reported_at: str,
     ) -> dict[str, Any]:
-        text = source_text(command)
-        target_id = parse_set_id(command.get("target_set_id"))
-        changes = command.get("changes")
-        if not isinstance(changes, dict) or not changes:
-            raise CommandError("MISSING_FIELD", field="changes")
-        allowed = {"exercise", "weight_kg", "reps", "performed_at"}
-        if set(changes) - allowed:
-            raise CommandError("INVALID_VALUE", field="changes")
-        target = con.execute(
-            """
-            SELECT set_performances.*, exercises.name AS exercise_name
-            FROM set_performances
-            JOIN exercises ON exercises.id = set_performances.exercise_id
-            WHERE set_performances.id = ?
-            """,
-            (target_id,),
-        ).fetchone()
-        if target is None:
-            raise CommandError("TARGET_NOT_FOUND", field="target_set_id")
-        if target["status"] != "active":
-            raise CommandError(
-                "TARGET_NOT_ACTIVE",
-                field="target_set_id",
-                current_set_id=self._active_successor(con, target_id),
-            )
+        text = command["source_text"]
+        target_id = command["target_set_id"]
+        changes = command["changes"]
+        target = self._active_target(con, target_id)
 
         if "exercise" in changes:
             exercise = self._exercise_by_name(con, changes["exercise"])
         else:
             exercise = {"id": target["exercise_id"], "name": target["exercise_name"]}
-        weight = parse_weight(changes.get("weight_kg", target["weight_kg"]))
-        reps = parse_reps(changes.get("reps", target["reps"]))
+        weight = changes.get("weight_kg", target["weight_kg"])
+        reps = changes.get("reps", target["reps"])
         if "performed_at" in changes:
             performed, performed_at = parse_performed_at(changes["performed_at"], now)
-            training_id = self._training_for(con, performed, now=reported_at, exclude_set_id=target_id)
+            training_id = self._training_for(con, performed, created_at=reported_at, exclude_set_id=target_id)
         else:
             performed_at = target["performed_at"]
             training_id = target["training_id"]
@@ -457,25 +492,8 @@ class TrainingJournal:
         reported_at: str,
     ) -> dict[str, Any]:
         del request_id, now, reported_at
-        source_text(command)
-        target_id = parse_set_id(command.get("target_set_id"))
-        target = con.execute(
-            """
-            SELECT set_performances.*, exercises.name AS exercise_name
-            FROM set_performances
-            JOIN exercises ON exercises.id = set_performances.exercise_id
-            WHERE set_performances.id = ?
-            """,
-            (target_id,),
-        ).fetchone()
-        if target is None:
-            raise CommandError("TARGET_NOT_FOUND", field="target_set_id")
-        if target["status"] != "active":
-            raise CommandError(
-                "TARGET_NOT_ACTIVE",
-                field="target_set_id",
-                current_set_id=self._active_successor(con, target_id),
-            )
+        target_id = command["target_set_id"]
+        target = self._active_target(con, target_id)
         updated = con.execute(
             "UPDATE set_performances SET status = 'voided' WHERE id = ? AND status = 'active'",
             (target_id,),
@@ -490,6 +508,26 @@ class TrainingJournal:
             target["reps"],
             target["performed_at"],
         )
+
+    def _active_target(self, con: sqlite3.Connection, set_id: int) -> sqlite3.Row:
+        target = con.execute(
+            """
+            SELECT set_performances.*, exercises.name AS exercise_name
+            FROM set_performances
+            JOIN exercises ON exercises.id = set_performances.exercise_id
+            WHERE set_performances.id = ?
+            """,
+            (set_id,),
+        ).fetchone()
+        if target is None:
+            raise CommandError("TARGET_NOT_FOUND", field="target_set_id")
+        if target["status"] != "active":
+            raise CommandError(
+                "TARGET_NOT_ACTIVE",
+                field="target_set_id",
+                current_set_id=self._active_successor(con, set_id),
+            )
+        return target
 
     def _active_successor(self, con: sqlite3.Connection, set_id: int) -> int | None:
         current = set_id
@@ -509,7 +547,7 @@ class TrainingJournal:
         con: sqlite3.Connection,
         performed: dt.datetime,
         *,
-        now: str,
+        created_at: str,
         exclude_set_id: int | None = None,
     ) -> int:
         query = "SELECT id, training_id, performed_at FROM set_performances WHERE status = 'active'"
@@ -528,7 +566,7 @@ class TrainingJournal:
                     training_id = row["training_id"]
         if nearest is not None:
             return training_id
-        return con.execute("INSERT INTO trainings(created_at) VALUES (?)", (now,)).lastrowid
+        return con.execute("INSERT INTO trainings(created_at) VALUES (?)", (created_at,)).lastrowid
 
     @staticmethod
     def _set_receipt(

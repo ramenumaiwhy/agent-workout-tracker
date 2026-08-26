@@ -256,7 +256,7 @@ reported_at
 
 ### `record_requests`
 
-依頼ID、commandのfingerprint、`receipt`、受付時刻を保存します。commandの処理と`receipt`の保存は1つのtransactionで行います。同じ依頼IDの再送で初回と同じ結果を返し、内容が異なる再送を拒否します。`request_id`の一意制約はこのtableで管理します。保存先へ到達できずtransactionを開始できない場合は結果を残せないため、同じ依頼IDで再試行できます。
+依頼ID、正規化済みcommand JSON、commandのfingerprint、`receipt`、受付時刻を保存します。取消を含む元の報告は、このcommand JSONの`source_text`から確認できます。commandの処理と`receipt`の保存は1つのtransactionで行います。同じ依頼IDの再送で初回と同じ結果を返し、内容が異なる再送を拒否します。`request_id`の一意制約はこのtableで管理します。保存先へ到達できずtransactionを開始できない場合は結果を残せないため、同じ依頼IDで再試行できます。
 
 commandのfingerprintは、入力JSONを検証した後、key順を固定した空白なしのUTF-8 JSONからSHA-256で作ります。同じ依頼IDで同じ正規化済みcommandを受けた場合だけ、保存済みの`receipt`を返します。
 
@@ -379,10 +379,4 @@ CLI adapterは起動時にbackupファイルの更新時刻を確認します。
 - Macを起動していない時間にも記録又は参照したい。
 - 複数端末から同時に記録する。
 
-Cloud版はWorker、D1、stateless Remote MCPで構成します。MCPはOAuth 2.1で保護します。記録moduleのinterfaceとトレーニング文脈の形は変更しません。
-
-## 参照資料
-
-- Tailscale Serve: https://tailscale.com/docs/features/tailscale-serve
-- Cloudflare Remote MCP: https://developers.cloudflare.com/agents/model-context-protocol/guides/remote-mcp-server/
-- Cloudflare D1: https://developers.cloudflare.com/d1/
+必要になった時点で保存先、通信、認証を選びます。記録moduleのinterfaceとトレーニング文脈の形は維持します。
