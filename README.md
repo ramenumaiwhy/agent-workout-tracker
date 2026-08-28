@@ -61,7 +61,7 @@ runtime dependencyはPython標準ライブラリだけです。
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-設計は[`docs/design.md`](docs/design.md)を参照してください。将来の音声入力は[`docs/voice-input.md`](docs/voice-input.md)へ分離しています。
+筋トレ記録の設計は[`docs/design.md`](docs/design.md)を参照してください。将来の音声入力は[`docs/voice-input.md`](docs/voice-input.md)へ分離しています。食事、身体、ジム及び筋トレを組み合わせる上位の分析設計は[`docs/body-change-system.md`](docs/body-change-system.md)にあります。
 
 ## License
 
