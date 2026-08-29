@@ -61,7 +61,7 @@ runtime dependencyはPython標準ライブラリだけです。
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-筋トレ記録の設計は[`docs/design.md`](docs/design.md)を参照してください。将来の音声入力は[`docs/voice-input.md`](docs/voice-input.md)へ分離しています。食事、身体、ジム及び筋トレを組み合わせる上位の分析設計は[`docs/body-change-system.md`](docs/body-change-system.md)にあります。
+筋トレ記録の設計は[`docs/design.md`](docs/design.md)を参照してください。将来の音声入力は[`docs/voice-input.md`](docs/voice-input.md)へ分離しています。食事フィードバック、行動支援、身体計測、ジム及び筋トレを組み合わせる全体設計は[`docs/body-change-system.md`](docs/body-change-system.md)にあります。食事フィードバックの具体的な変更順は、[`meal-tracker`の実装計画](https://github.com/ramenumaiwhy/meal-tracker/blob/main/docs/meal-feedback-implementation-plan.md)にあります。
 
 ## License
 
