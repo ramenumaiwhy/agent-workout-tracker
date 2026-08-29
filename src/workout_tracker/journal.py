@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS set_performances (
   training_id INTEGER NOT NULL REFERENCES trainings(id),
   exercise_id INTEGER NOT NULL REFERENCES exercises(id),
   performed_at TEXT NOT NULL,
-  weight_kg REAL NOT NULL CHECK(weight_kg > 0 AND weight_kg <= 500),
+  weight_kg REAL NOT NULL CHECK(weight_kg >= 0 AND weight_kg <= 500),
   reps INTEGER NOT NULL CHECK(typeof(reps) = 'integer' AND reps >= 1 AND reps <= 100),
   status TEXT NOT NULL CHECK(status IN ('active', 'superseded', 'voided')),
   supersedes_id INTEGER UNIQUE REFERENCES set_performances(id),
@@ -122,9 +122,59 @@ def parse_weight(value: Any, field: str = "weight_kg") -> float:
         decimal = Decimal(str(value))
     except InvalidOperation as error:
         raise CommandError("INVALID_VALUE", field=field) from error
-    if decimal <= 0 or decimal > 500 or decimal.as_tuple().exponent < -3:
+    if decimal < 0 or decimal > 500 or decimal.as_tuple().exponent < -3:
         raise CommandError("INVALID_VALUE", field=field)
     return float(decimal)
+
+
+def migrate_bodyweight_support(con: sqlite3.Connection) -> None:
+    row = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'set_performances'").fetchone()
+    if row is None or not isinstance(row["sql"], str):
+        return
+    normalized_sql = "".join(row["sql"].lower().split())
+    if "check(weight_kg>0andweight_kg<=500)" not in normalized_sql:
+        return
+
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("ALTER TABLE set_performances RENAME TO set_performances_legacy")
+        con.execute(
+            """
+            CREATE TABLE set_performances (
+              id INTEGER PRIMARY KEY,
+              training_id INTEGER NOT NULL REFERENCES trainings(id),
+              exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+              performed_at TEXT NOT NULL,
+              weight_kg REAL NOT NULL CHECK(weight_kg >= 0 AND weight_kg <= 500),
+              reps INTEGER NOT NULL CHECK(typeof(reps) = 'integer' AND reps >= 1 AND reps <= 100),
+              status TEXT NOT NULL CHECK(status IN ('active', 'superseded', 'voided')),
+              supersedes_id INTEGER UNIQUE REFERENCES set_performances(id),
+              request_id TEXT NOT NULL REFERENCES record_requests(request_id),
+              source_text TEXT NOT NULL,
+              reported_at TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO set_performances(
+              id, training_id, exercise_id, performed_at, weight_kg, reps, status,
+              supersedes_id, request_id, source_text, reported_at
+            )
+            SELECT
+              id, training_id, exercise_id, performed_at, weight_kg, reps, status,
+              supersedes_id, request_id, source_text, reported_at
+            FROM set_performances_legacy
+            """
+        )
+        con.execute("DROP TABLE set_performances_legacy")
+        con.execute("CREATE INDEX idx_sets_active_time ON set_performances(status, performed_at)")
+        con.execute("CREATE INDEX idx_sets_exercise_active_time ON set_performances(exercise_id, status, performed_at)")
+        con.execute("CREATE INDEX idx_sets_training_active_time ON set_performances(training_id, status, performed_at)")
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
 
 
 def parse_reps(value: Any, field: str = "reps") -> int:
@@ -247,7 +297,11 @@ class TrainingJournal:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         con = self._connect()
         try:
-            con.executescript(SCHEMA)
+            try:
+                con.executescript(SCHEMA)
+                migrate_bodyweight_support(con)
+            except sqlite3.Error as error:
+                raise StorageUnavailable(str(error)) from error
         finally:
             con.close()
 

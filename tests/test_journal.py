@@ -10,7 +10,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workout_tracker.journal import CommandError, TrainingJournal, maybe_backup
+from workout_tracker.journal import SCHEMA, CommandError, TrainingJournal, maybe_backup
 from workout_tracker.render import render_progress
 
 
@@ -269,10 +269,84 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(progress["points"][0]["weight_kg"], 60.0)
         self.assertEqual(progress["points"][0]["reps"], 10)
 
+    def test_bodyweight_set_uses_zero_external_weight(self) -> None:
+        self.register("プッシュアップ")
+
+        receipt = self.add(
+            exercise="プッシュアップ",
+            weight=0,
+            reps=20,
+            source_text="プッシュアップ20回",
+        )
+
+        self.assertEqual(receipt["status"], "recorded")
+        self.assertEqual(receipt["normalized_set"]["weight_kg"], 0.0)
+        self.assertEqual(receipt["normalized_set"]["reps"], 20)
+
+    def test_existing_database_is_migrated_to_allow_bodyweight(self) -> None:
+        legacy_db = Path(self.temp.name) / "legacy.sqlite3"
+        legacy_schema = SCHEMA.replace(
+            "CHECK(weight_kg >= 0 AND weight_kg <= 500)",
+            "CHECK(weight_kg > 0 AND weight_kg <= 500)",
+        )
+        con = sqlite3.connect(legacy_db)
+        con.executescript(legacy_schema)
+        con.execute(
+            "INSERT INTO exercises(id, name, name_key, created_at) VALUES (1, 'ベンチプレス', 'ベンチプレス', ?)",
+            (self.now.isoformat(),),
+        )
+        con.execute("INSERT INTO trainings(id, created_at) VALUES (1, ?)", (self.now.isoformat(),))
+        con.execute(
+            """
+            INSERT INTO record_requests(
+              request_id, command_fingerprint, command_json, receipt_json, received_at
+            ) VALUES ('legacy', 'fingerprint', '{}', '{}', ?)
+            """,
+            (self.now.isoformat(),),
+        )
+        con.execute(
+            """
+            INSERT INTO set_performances(
+              id, training_id, exercise_id, performed_at, weight_kg, reps, status,
+              supersedes_id, request_id, source_text, reported_at
+            ) VALUES (1, 1, 1, ?, 60, 10, 'active', NULL, 'legacy', 'ベンチプレス60キロ10回', ?)
+            """,
+            (self.now.isoformat(), self.now.isoformat()),
+        )
+        con.commit()
+        con.close()
+
+        migrated = TrainingJournal(legacy_db, clock=lambda: self.now)
+        preserved = (
+            sqlite3.connect(legacy_db).execute("SELECT weight_kg, reps FROM set_performances WHERE id = 1").fetchone()
+        )
+        migrated.record(
+            {
+                "type": "register_exercise",
+                "name": "プッシュアップ",
+                "aliases": [],
+                "source_text": "プッシュアップを登録",
+            },
+            self.request_id(),
+        )
+        receipt = migrated.record(
+            {
+                "type": "add_set",
+                "exercise": "プッシュアップ",
+                "weight_kg": 0,
+                "reps": 20,
+                "source_text": "プッシュアップ20回",
+            },
+            self.request_id(),
+        )
+
+        self.assertEqual(preserved, (60.0, 10))
+        self.assertEqual(receipt["status"], "recorded")
+
     def test_invalid_values_are_not_saved(self) -> None:
         self.register()
         cases = [
-            {"weight": 0, "reps": 10},
+            {"weight": -0.1, "reps": 10},
             {"weight": 500.1, "reps": 10},
             {"weight": 60, "reps": 0},
             {"weight": 60, "reps": 101},
@@ -330,6 +404,23 @@ class BackupAndRenderTests(unittest.TestCase):
             self.assertIn("<svg", page)
             self.assertIn("62.5kg・8回", page)
             self.assertNotIn("https://", page)
+
+    def test_render_labels_zero_weight_as_bodyweight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "progress.html"
+            render_progress(
+                {
+                    "exercise": "プッシュアップ",
+                    "points": [
+                        {"training_id": 1, "date": "2026-08-23", "weight_kg": 0, "reps": 20},
+                    ],
+                },
+                output,
+            )
+
+            page = output.read_text(encoding="utf-8")
+            self.assertIn("自重・20回", page)
+            self.assertNotIn("0kg・20回", page)
 
 
 class CliTests(unittest.TestCase):

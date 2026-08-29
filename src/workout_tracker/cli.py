@@ -44,8 +44,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     path = db_path()
     try:
+        existed = path.exists()
+        warning = maybe_backup(path, path.with_name("workout.backup.sqlite3")) if existed else None
         journal = TrainingJournal(path)
-        warning = maybe_backup(path, path.with_name("workout.backup.sqlite3"))
+        if not existed:
+            warning = maybe_backup(path, path.with_name("workout.backup.sqlite3"))
         if warning:
             print(warning, file=sys.stderr)
 

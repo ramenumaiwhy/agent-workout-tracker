@@ -52,7 +52,8 @@ def _chart(points: list[dict[str, Any]]) -> str:
     polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in coordinates)
     marks = []
     for x, y, point in coordinates:
-        weight = f"{float(point['weight_kg']):g}kg"
+        weight_value = float(point["weight_kg"])
+        weight = "自重" if weight_value == 0 else f"{weight_value:g}kg"
         marks.append(
             f'<text class="label" x="{x:.1f}" y="{y - 20:.1f}">{html.escape(weight)}・{int(point["reps"])}回</text>'
             f'<circle class="dot" cx="{x:.1f}" cy="{y:.1f}" r="7"/>'

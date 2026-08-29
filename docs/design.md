@@ -58,7 +58,7 @@ AIエージェントは自然文を理解します。記録moduleは自然文を
 AddSet:
   type = add_set
   exercise
-  weight_kg
+  weight_kg  # 自重種目の外部負荷は0
   reps
   performed_at?
   source_text
@@ -136,7 +136,7 @@ skillには次を記載します。
 
 - 完了したセット実績の報告、訂正、取消、次回メニュー、重量グラフの依頼で起動する。
 - 予定、目標、設計相談では記録しない。
-- 種目、重量、回数が不足又は曖昧な場合は、CLIを呼ぶ前に質問する。
+- 種目、外部負荷、回数が不足又は曖昧な場合は、CLIを呼ぶ前に質問する。追加負荷がない自重種目では外部負荷を0kgとする。
 - 利用者が複数のセット実績を1回で報告した場合は、報告順に`AddSet`を複数回呼ぶ。
 - 「今の」は会話中の`receipt.set_id`を使う。ない場合はトレーニング文脈を取得し、曖昧なら質問する。
 - `UNKNOWN_EXERCISE`では、利用者へ種目登録の確認を行う。明示的な同意後だけ`RegisterExercise`を呼ぶ。
@@ -185,7 +185,7 @@ AIエージェントは次を行います。
 - 結果が不明な失敗又は`STORAGE_UNAVAILABLE`の再試行では、同じ依頼IDと同じcommandを使います。
 - `record_requests`へ結果が保存済みの場合、同じ依頼IDと同じcommandの再送には初回と同じ`receipt`を返します。
 - 同じ依頼IDでcommandが異なる場合は`IDEMPOTENCY_CONFLICT`を返します。
-- 重量は0kgより大きく、500kg以下です。
+- 外部負荷は0kg以上、500kg以下です。0kgは追加負荷がない自重種目を表します。
 - 回数は1回以上、100回以下です。
 - `AddSet`は1件のセット実績だけを保存します。
 - 元の報告は`source_text`として変更せずに残します。
@@ -260,7 +260,7 @@ reported_at
 
 commandのfingerprintは、入力JSONを検証した後、key順を固定した空白なしのUTF-8 JSONからSHA-256で作ります。同じ依頼IDで同じ正規化済みcommandを受けた場合だけ、保存済みの`receipt`を返します。
 
-全SQLite接続で`PRAGMA foreign_keys = ON`を設定し、有効になったことを確認します。書き込みは`BEGIN IMMEDIATE`を使い、commandの適用と`record_requests`への`receipt`保存を1つのtransactionにします。接続には5秒のbusy timeoutを設定します。schema作成は起動時に冪等に行います。MVPは新規DBのため、migration frameworkは作りません。
+全SQLite接続で`PRAGMA foreign_keys = ON`を設定し、有効になったことを確認します。書き込みは`BEGIN IMMEDIATE`を使い、commandの適用と`record_requests`への`receipt`保存を1つのtransactionにします。接続には5秒のbusy timeoutを設定します。schema作成は起動時に冪等に行います。旧DBの重量制約は、起動時に外部負荷0kgを許可する制約へ移行します。migration frameworkは作りません。
 
 ## 重量グラフ
 
@@ -274,7 +274,7 @@ e1RM、総volume、PR判定はMVPへ入れません。
 
 CLI adapter又はSQLiteで失敗した場合、AIエージェントは「記録できませんでした」と返します。会話に利用者の報告が残るため、iPhone側の退避処理は作りません。利用者は障害解消後に同じ報告を再実行できます。
 
-CLI adapterは起動時にbackupファイルの更新時刻を確認します。ファイルがない場合又は24時間以上経過している場合は、`sqlite3.Connection.backup`で1回保存します。backupは一時ファイルへ作り、完了後に固定名へ置き換えます。backup失敗は現在の記録を止めません。`receipt.warnings`と標準エラー出力へ警告を返します。固定名の更新時刻は成功時だけ変わるため、失敗時は次回のCLI起動で再試行します。常駐処理とbackup管理tableは追加しません。セット実績は後から正確に再生成できないためです。
+CLI adapterは起動時にbackupファイルの更新時刻を確認します。既存DBはschema移行前にbackupします。ファイルがない場合又は24時間以上経過している場合は、`sqlite3.Connection.backup`で1回保存します。backupは一時ファイルへ作り、完了後に固定名へ置き換えます。backup失敗は現在の記録を止めません。`receipt.warnings`と標準エラー出力へ警告を返します。固定名の更新時刻は成功時だけ変わるため、失敗時は次回のCLI起動で再試行します。常駐処理とbackup管理tableは追加しません。セット実績は後から正確に再生成できないためです。
 
 ## 既存の食事記録から使う考え方
 
@@ -294,6 +294,7 @@ CLI adapterは起動時にbackupファイルの更新時刻を確認します。
 - AIエージェント用`SKILL.md`
 - ローカルCLI adapter
 - kgと回数
+- 追加負荷がない自重種目
 - 通常記録
 - 対象IDを指定した訂正
 - 対象IDを指定した取消
@@ -333,6 +334,7 @@ CLI adapterは起動時にbackupファイルの更新時刻を確認します。
 実装完了は次の条件で判定します。
 
 - AIエージェントへの1回の報告で、1件のセット実績を記録できる。
+- 追加負荷がない自重種目を、外部負荷0kgのセット実績として記録できる。
 - 代表的な報告10件から、AIエージェントが正しいcommand列を作れる。複数セット、過去日付、曖昧な報告、未登録種目を含める。
 - 代表的な報告10件を`SKILL.md`の例にも使う。
 - 不足又は曖昧な報告では、AIエージェントが確認してから記録する。
