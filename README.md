@@ -7,35 +7,35 @@ MVPの入力元はAIエージェントです。Siri、音声認識、入力用We
 ## 必要な環境
 
 - Python 3.11以上
-- [uv](https://docs.astral.sh/uv/)を推奨
+- [uv](https://docs.astral.sh/uv/)（以下の導入手順で使用）
 
 ## インストール
 
-GitHub公開後は次のコマンドでインストールできます。
-
 ```sh
 uv tool install git+https://github.com/ramenumaiwhy/agent-workout-tracker
-```
-
-開発中のローカルcheckoutを試す場合は、repoのルートで次を実行します。
-
-```sh
-uv tool install .
 workout --help
 ```
 
-## AIエージェントとの接続
+`workout` が見つからない場合は、`uv tool update-shell` を実行してシェルを開き直してください。
 
-AIエージェントは、自然文の報告を構造化し、`workout`を呼びます。SQLiteを直接読みません。対応する`$workout`スキルは、公開後に[ramenumaiwhy/skills](https://github.com/ramenumaiwhy/skills)から配布します。
+同じ版をインストールするには、Git URLの末尾に `@<コミットSHA>` を付けます。ローカルの変更を試すには、リポジトリのルートで `uv run --locked workout --help` を実行します。
 
-初めて使う種目は、利用者の同意後に種目登録します。
+## 試しに記録する
+
+次の例はmacOSのシェルで実行できます。サンプルのセット実績は一時ディレクトリへ保存します。
+
+```sh
+export WORKOUT_DB_PATH="$(mktemp -d)/workout.sqlite3"
+```
+
+種目を登録します。
 
 ```sh
 printf '%s\n' '{"type":"register_exercise","name":"ベンチプレス","aliases":["ベンチ"],"source_text":"ベンチプレスとして登録することに同意"}' \
   | workout record --request-id "$(uuidgen)"
 ```
 
-種目登録後にセット実績を記録します。依頼IDは操作ごとに新しいUUIDを使います。同じ操作を再試行する場合だけ同じ依頼IDを使います。
+種目登録後にセット実績を記録します。
 
 ```sh
 printf '%s\n' '{"type":"add_set","exercise":"ベンチプレス","weight_kg":60,"reps":10,"source_text":"ベンチプレス60キロ10回"}' \
@@ -48,20 +48,35 @@ printf '%s\n' '{"type":"add_set","exercise":"ベンチプレス","weight_kg":60,
 workout context --json
 workout progress --json
 workout progress --exercise ベンチプレス --json
-workout progress --exercise ベンチプレス --html ./progress.html
+workout progress --exercise ベンチプレス --html "$(dirname "$WORKOUT_DB_PATH")/progress.html"
+unset WORKOUT_DB_PATH
 ```
 
-既定の保存先は`~/.local/share/workout-tracker/workout.sqlite3`です。試験時だけ`WORKOUT_DB_PATH`で変更できます。
+## AIエージェントとの接続
+
+利用するAIエージェントに、上の例と [CLI仕様](docs/design.md#moduleとinterface) を渡してください。AIエージェントは報告を構造化して `workout record` の標準入力にJSONを1件渡し、標準出力の `status` を確認します。`not_recorded` も終了コードは0です。訂正・取消には対象の `set_id` を指定します。次回メニューの提案には `workout context --json` を使います。
+
+種目登録は利用者の同意後に行います。操作ごとに新しいUUIDを作り、結果が不明な操作の再試行には同じ依頼IDと同じJSONを使います。実施時刻の指定を省略すると報告時刻を使います。指定する場合はUTCオフセット付きのISO 8601形式を使います。
+
+## 保存先
+
+SQLiteの既定の保存先は `~/.local/share/workout-tracker/workout.sqlite3` です。バックアップは同じディレクトリの `workout.backup.sqlite3` に作ります。DBとバックアップには報告の原文が含まれます。HTMLには種目名と実施日、重量、回数が含まれます。`WORKOUT_DB_PATH` や `--html` で場所を指定する場合も、DB、SQLiteの付随ファイル、バックアップ、HTMLをGitの作業ツリーの外に保管してください。
+
+macOSやLinuxで以前の版から更新した場合は、`ls -l` で既存のDBとバックアップが `-rw-------` か確認してください。必要なら、CLIやほかのSQLite接続を閉じてから、自分が所有する各ファイルに `chmod 600 <ファイルのパス>` を実行します。
+
+バックアップの由来を確認できない場合は `BACKUP_FAILED` が出ます。以前の版で作成したバックアップが該当する場合は、元のDBを確認してから別の場所に保管すると、次回の起動時に新しいバックアップが作られます。
+
+バックアップをCLIで確認するときは、作業ツリー外に作ったコピーを `WORKOUT_DB_PATH` に指定してください。復元にもコピーを使うと、元のバックアップの照合情報を保てます。
 
 ## 開発
 
-runtime dependencyはPython標準ライブラリだけです。
+実行時依存はPython標準ライブラリだけです。
 
 ```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -v
 ```
 
-筋トレ記録の設計は[`docs/design.md`](docs/design.md)を参照してください。将来の音声入力は[`docs/voice-input.md`](docs/voice-input.md)へ分離しています。食事フィードバック、行動支援、身体計測、ジム及び筋トレを組み合わせる全体設計は[`docs/body-change-system.md`](docs/body-change-system.md)にあります。食事フィードバックの具体的な変更順は、[`meal-tracker`の実装計画](https://github.com/ramenumaiwhy/meal-tracker/blob/main/docs/meal-feedback-implementation-plan.md)にあります。
+筋トレ記録の設計は [`docs/design.md`](docs/design.md)、将来の音声入力は [`docs/voice-input.md`](docs/voice-input.md) を参照してください。
 
 ## License
 

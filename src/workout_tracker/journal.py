@@ -3,10 +3,14 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import math
 import os
 import sqlite3
+import stat
+import tempfile
+import time
 import unicodedata
+import uuid
+from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -64,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_sets_training_active_time
 """
 
 FOUR_HOURS = dt.timedelta(hours=4)
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 class StorageUnavailable(RuntimeError):
@@ -116,13 +121,13 @@ def source_text(command: dict[str, Any]) -> str:
 
 
 def parse_weight(value: Any, field: str = "weight_kg") -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 500:
         raise CommandError("INVALID_VALUE", field=field)
     try:
         decimal = Decimal(str(value))
     except InvalidOperation as error:
         raise CommandError("INVALID_VALUE", field=field) from error
-    if decimal < 0 or decimal > 500 or decimal.as_tuple().exponent < -3:
+    if decimal.as_tuple().exponent < -3:
         raise CommandError("INVALID_VALUE", field=field)
     return float(decimal)
 
@@ -184,26 +189,25 @@ def parse_reps(value: Any, field: str = "reps") -> int:
 
 
 def parse_set_id(value: Any, field: str = "target_set_id") -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 2**63 - 1:
         raise CommandError("INVALID_VALUE", field=field)
     return value
 
 
-def parse_performed_at(value: Any, now: dt.datetime, field: str = "performed_at") -> tuple[dt.datetime, str]:
-    if value is None:
-        return now, iso_seconds(now)
+def parse_performed_at(value: Any, field: str = "performed_at") -> tuple[dt.datetime, str]:
     if not isinstance(value, str):
         raise CommandError("INVALID_VALUE", field=field)
     try:
-        parsed = dt.datetime.fromisoformat(value)
-    except ValueError as error:
+        parsed = dt.datetime.fromisoformat(value).replace(microsecond=0)
+        if parsed.tzinfo is not None:
+            parsed.astimezone(dt.timezone.utc)
+            return parsed, iso_seconds(parsed)
+    except (ValueError, OverflowError) as error:
         raise CommandError("INVALID_VALUE", field=field) from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise CommandError("INVALID_VALUE", field=field)
-    return parsed, iso_seconds(parsed)
+    raise CommandError("INVALID_VALUE", field=field)
 
 
-def normalize_command(command: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
+def normalize_command(command: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(command, dict):
         raise CommandError("INVALID_VALUE", field="command")
     command_type = command.get("type")
@@ -224,7 +228,7 @@ def normalize_command(command: dict[str, Any], now: dt.datetime) -> dict[str, An
             "source_text": text,
         }
         if "performed_at" in command:
-            normalized["performed_at"] = parse_performed_at(command["performed_at"], now)[1]
+            normalized["performed_at"] = parse_performed_at(command["performed_at"])[1]
         return normalized
 
     if command_type == "correct_set":
@@ -242,7 +246,7 @@ def normalize_command(command: dict[str, Any], now: dt.datetime) -> dict[str, An
         if "reps" in changes:
             normalized_changes["reps"] = parse_reps(changes["reps"])
         if "performed_at" in changes:
-            normalized_changes["performed_at"] = parse_performed_at(changes["performed_at"], now)[1]
+            normalized_changes["performed_at"] = parse_performed_at(changes["performed_at"])[1]
         return {
             "type": command_type,
             "target_set_id": parse_set_id(command.get("target_set_id")),
@@ -292,18 +296,20 @@ class TrainingJournal:
         *,
         clock: Callable[[], dt.datetime] = local_now,
     ) -> None:
-        self.db_path = Path(db_path).expanduser()
+        self.db_path = Path(db_path).expanduser().resolve()
         self.clock = clock
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        con = self._connect()
         try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
             try:
+                self.db_path.touch(mode=0o600, exist_ok=False)
+            except FileExistsError:
+                pass
+            with closing(self._connect()) as con:
                 con.executescript(SCHEMA)
                 migrate_bodyweight_support(con)
-            except sqlite3.Error as error:
-                raise StorageUnavailable(str(error)) from error
-        finally:
-            con.close()
+                con.execute("DROP TABLE IF EXISTS workout_backup_origin")
+        except (OSError, sqlite3.Error) as error:
+            raise StorageUnavailable(str(error)) from error
 
     def _connect(self) -> sqlite3.Connection:
         try:
@@ -327,19 +333,23 @@ class TrainingJournal:
     ) -> dict[str, Any]:
         if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100:
             return CommandError("INVALID_VALUE", field="request_id").receipt()
-        con = self._connect()
+        try:
+            request_id.encode("utf-8")
+        except UnicodeEncodeError:
+            return CommandError("INVALID_VALUE", field="request_id").receipt()
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
-            con.close()
             raise StorageUnavailable("clock must return an offset-aware datetime")
         try:
-            command = normalize_command(command, now)
+            command = normalize_command(command)
             command_json = canonical_command_json(command)
+            fingerprint = hashlib.sha256(command_json.encode("utf-8")).hexdigest()
         except CommandError as error:
-            con.close()
             return error.receipt()
-        fingerprint = hashlib.sha256(command_json.encode("utf-8")).hexdigest()
+        except UnicodeEncodeError:
+            return CommandError("INVALID_VALUE", field="command").receipt()
         reported_at = iso_seconds(now)
+        con = self._connect()
         try:
             con.execute("BEGIN IMMEDIATE")
             previous = con.execute(
@@ -471,7 +481,9 @@ class TrainingJournal:
         exercise = self._exercise_by_name(con, command["exercise"])
         weight = command["weight_kg"]
         reps = command["reps"]
-        performed, performed_at = parse_performed_at(command.get("performed_at"), now)
+        performed, performed_at = now, reported_at
+        if "performed_at" in command:
+            performed, performed_at = parse_performed_at(command["performed_at"])
         training_id = self._training_for(con, performed, created_at=reported_at)
         cursor = con.execute(
             """
@@ -492,6 +504,7 @@ class TrainingJournal:
         now: dt.datetime,
         reported_at: str,
     ) -> dict[str, Any]:
+        del now
         text = command["source_text"]
         target_id = command["target_set_id"]
         changes = command["changes"]
@@ -504,7 +517,7 @@ class TrainingJournal:
         weight = changes.get("weight_kg", target["weight_kg"])
         reps = changes.get("reps", target["reps"])
         if "performed_at" in changes:
-            performed, performed_at = parse_performed_at(changes["performed_at"], now)
+            performed, performed_at = parse_performed_at(changes["performed_at"])
             training_id = self._training_for(con, performed, created_at=reported_at, exclude_set_id=target_id)
         else:
             performed_at = target["performed_at"]
@@ -612,7 +625,7 @@ class TrainingJournal:
         nearest: tuple[float, int] | None = None
         for row in con.execute(query, params):
             candidate = dt.datetime.fromisoformat(row["performed_at"])
-            distance = abs((candidate.astimezone(dt.timezone.utc) - performed.astimezone(dt.timezone.utc)).total_seconds())
+            distance = abs((candidate - performed).total_seconds())
             if distance <= FOUR_HOURS.total_seconds():
                 choice = (distance, row["id"])
                 if nearest is None or choice < nearest:
@@ -658,7 +671,7 @@ class TrainingJournal:
             ).fetchall()
             active.sort(
                 key=lambda row: (
-                    dt.datetime.fromisoformat(row["performed_at"]).astimezone(dt.timezone.utc),
+                    dt.datetime.fromisoformat(row["performed_at"]),
                     row["set_id"],
                 )
             )
@@ -679,19 +692,19 @@ class TrainingJournal:
                     recent.append(
                         {
                             "training_id": training_id,
-                            "performed_on": min(
-                                sets,
-                                key=lambda item: dt.datetime.fromisoformat(item["performed_at"]).astimezone(
-                                    dt.timezone.utc
-                                ),
-                            )["performed_at"][:10],
+                            "performed_on": sets[0]["performed_at"][:10],
                             "sets": sets,
                         }
                     )
                 latest = max((dt.datetime.fromisoformat(row["performed_at"]) for row in rows), default=None)
                 days_since_last = None
                 if latest is not None:
-                    days_since_last = max(0, (now.date() - latest.astimezone(now.tzinfo).date()).days)
+                    try:
+                        latest_date = latest.astimezone(now.tzinfo).date()
+                    except OverflowError:
+                        # The local date falls outside Python's calendar at one end.
+                        latest_date = dt.date.min if latest.year == dt.MINYEAR else dt.date.max
+                    days_since_last = max(0, (now.date() - latest_date).days)
                 exercises.append(
                     {
                         "exercise": exercise["name"],
@@ -714,11 +727,10 @@ class TrainingJournal:
     @staticmethod
     def _current_training_id(rows: list[sqlite3.Row], now: dt.datetime) -> int | None:
         candidates: list[tuple[dt.datetime, int]] = []
-        now_utc = now.astimezone(dt.timezone.utc)
         for row in rows:
             performed = dt.datetime.fromisoformat(row["performed_at"])
-            if abs(now_utc - performed.astimezone(dt.timezone.utc)) <= FOUR_HOURS:
-                candidates.append((performed.astimezone(dt.timezone.utc), row["training_id"]))
+            if abs(now - performed) <= FOUR_HOURS:
+                candidates.append((performed, row["training_id"]))
         return max(candidates)[1] if candidates else None
 
     @staticmethod
@@ -748,7 +760,7 @@ class TrainingJournal:
             ).fetchall()
             rows.sort(
                 key=lambda row: (
-                    dt.datetime.fromisoformat(row["performed_at"]).astimezone(dt.timezone.utc),
+                    dt.datetime.fromisoformat(row["performed_at"]),
                     row["id"],
                 )
             )
@@ -761,12 +773,7 @@ class TrainingJournal:
                 points.append(
                     {
                         "training_id": top["training_id"],
-                        "date": min(
-                            training_rows,
-                            key=lambda row: dt.datetime.fromisoformat(row["performed_at"]).astimezone(
-                                dt.timezone.utc
-                            ),
-                        )["performed_at"][:10],
+                        "date": training_rows[0]["performed_at"][:10],
                         "weight_kg": top["weight_kg"],
                         "reps": top["reps"],
                     }
@@ -777,29 +784,112 @@ class TrainingJournal:
             con.close()
 
 
+def _database_id(con: sqlite3.Connection) -> str | None:
+    table = con.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workout_database_identity'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = con.execute("SELECT database_id FROM workout_database_identity WHERE singleton = 1").fetchone()
+    return row[0] if row else None
+
+
+def _ensure_database_id(source_uri: str) -> str:
+    with closing(sqlite3.connect(f"{source_uri}?mode=rw", uri=True)) as con:
+        database_id = _database_id(con)
+        if database_id is None:
+            with con:
+                con.execute("BEGIN IMMEDIATE")
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS workout_database_identity (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        database_id TEXT NOT NULL
+                    )
+                    """
+                )
+                con.execute(
+                    "INSERT INTO workout_database_identity VALUES (1, ?) ON CONFLICT (singleton) DO NOTHING",
+                    (uuid.uuid4().hex,),
+                )
+                database_id = _database_id(con)
+    if not database_id:
+        raise OSError("source database could not be identified")
+    return database_id
+
+
+def _owned_backup(destination: Path, source_key: str) -> os.stat_result | None:
+    if any(os.path.lexists(f"{destination}{suffix}") for suffix in SQLITE_SIDECAR_SUFFIXES):
+        raise OSError("backup destination has SQLite sidecar files")
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("backup destination is not a regular file")
+    try:
+        # Inspect the snapshot without SQLite creating or changing sidecar files.
+        uri = f"{destination.absolute().as_uri()}?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, timeout=0, uri=True)) as con:
+            identity = con.execute("SELECT source_key, file_id FROM workout_backup_origin").fetchone()
+    except sqlite3.Error as error:
+        raise OSError("backup destination could not be identified") from error
+    if identity != (source_key, str(info.st_ino)):
+        raise OSError("backup destination could not be identified")
+    return info
+
+
 def maybe_backup(db_path: str | Path, backup_path: str | Path, *, now: float | None = None) -> str | None:
-    source_path = Path(db_path).expanduser()
     destination = Path(backup_path).expanduser()
     current_time = now if now is not None else dt.datetime.now().timestamp()
     try:
-        if destination.exists() and current_time - destination.stat().st_mtime < 24 * 60 * 60:
+        source_path = Path(db_path).expanduser().resolve()
+        source_info = source_path.stat()
+        source_uri = source_path.as_uri()
+        database_id = _ensure_database_id(source_uri)
+        source_key = hashlib.sha256(
+            f"{source_uri}\n{source_info.st_ino}\n{database_id}".encode("utf-8")
+        ).hexdigest()
+        previous = _owned_backup(destination, source_key)
+        if previous is not None and current_time - previous.st_mtime < 24 * 60 * 60:
             return None
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".tmp")
-        temporary.unlink(missing_ok=True)
-        source = sqlite3.connect(source_path, timeout=5)
-        target = sqlite3.connect(temporary)
-        try:
-            with target:
-                source.backup(target)
-        finally:
-            target.close()
-            source.close()
-        os.replace(temporary, destination)
+        with tempfile.TemporaryDirectory(dir=destination.parent) as scratch:
+            temporary = Path(scratch) / destination.name
+            temporary.touch(mode=0o600)
+            deadline = time.monotonic() + 5
+
+            def check_deadline(status: int, remaining: int, total: int) -> None:
+                if status != sqlite3.SQLITE_DONE and time.monotonic() >= deadline:
+                    raise TimeoutError("SQLite backup deadline exceeded")
+
+            with (
+                closing(sqlite3.connect(f"{source_uri}?mode=ro", timeout=0, uri=True)) as source,
+                closing(sqlite3.connect(temporary)) as target,
+            ):
+                source.backup(target, pages=256, progress=check_deadline)
+                if _database_id(target) != database_id:
+                    raise OSError("source database changed during backup")
+                target.execute("PRAGMA journal_mode = DELETE").fetchone()
+                with target:
+                    target.execute("DROP TABLE IF EXISTS workout_backup_origin")
+                    target.execute("CREATE TABLE workout_backup_origin(source_key TEXT, file_id TEXT)")
+                    target.execute(
+                        "INSERT INTO workout_backup_origin VALUES (?, ?)",
+                        (source_key, str(temporary.stat().st_ino)),
+                    )
+            remaining = max(0, deadline - time.monotonic())
+            with closing(sqlite3.connect(f"{source_uri}?mode=ro", timeout=remaining, uri=True)) as current:
+                if _database_id(current) != database_id or not os.path.samestat(source_info, source_path.stat()):
+                    raise OSError("source database changed during backup")
+            previous = _owned_backup(destination, source_key)
+            if previous is None:
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError:
+                    _owned_backup(destination, source_key)
+            elif current_time - previous.st_mtime >= 24 * 60 * 60:
+                os.replace(temporary, destination)
         return None
     except (OSError, sqlite3.Error) as error:
-        try:
-            destination.with_name(destination.name + ".tmp").unlink(missing_ok=True)
-        except OSError:
-            pass
         return f"BACKUP_FAILED: {error}"

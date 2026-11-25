@@ -1,0 +1,11 @@
+version = 1
+revision = 5
+requires-python = ">=3.11"
+
+[manifest]
+build-constraints = [{ name = "setuptools", specifier = "==84.2.1" }]
+
+[[package]]
+name = "agent-workout-tracker"
+version = "0.1.0"
+source = { editable = "." }

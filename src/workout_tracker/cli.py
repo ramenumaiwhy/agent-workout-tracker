@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .journal import CommandError, StorageUnavailable, TrainingJournal, maybe_backup
+from .journal import SQLITE_SIDECAR_SUFFIXES, CommandError, StorageUnavailable, TrainingJournal, maybe_backup
 from .render import render_progress
 
 
@@ -41,23 +41,49 @@ def print_json(value: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
-    path = db_path()
+    cli = parser()
+    args = cli.parse_args(argv)
+    if args.subcommand == "record":
+        try:
+            command = json.load(sys.stdin)
+        except (ValueError, RecursionError) as error:
+            print(f"INVALID_JSON: {error}", file=sys.stderr)
+            return 2
+    output_path = None
+    if args.subcommand == "progress" and args.html is not None:
+        if args.exercise is None or not args.html:
+            cli.error("--htmlには種目と空でない出力先が必要です。")
+        output_path = Path(args.html).expanduser()
     try:
+        path = db_path().resolve()
+        if not path.name:
+            raise StorageUnavailable("DBの保存先にはファイル名が必要です。")
+        backup = path.with_suffix(f".backup{path.suffix}")
+        if output_path is not None:
+            try:
+                output_path = output_path.resolve()
+                protected_paths = (
+                    Path(f"{database}{suffix}")
+                    for database in (path, backup)
+                    for suffix in ("", *SQLITE_SIDECAR_SUFFIXES)
+                )
+                for protected in protected_paths:
+                    if output_path == protected.resolve() or (
+                        output_path.exists() and protected.exists() and output_path.samefile(protected)
+                    ):
+                        cli.error("--htmlの出力先にDB、バックアップ、SQLiteの付随ファイルは指定できません。")
+            except OSError as error:
+                print(f"EXPORT_FAILED: {error}", file=sys.stderr)
+                return 1
         existed = path.exists()
-        warning = maybe_backup(path, path.with_name("workout.backup.sqlite3")) if existed else None
+        warning = maybe_backup(path, backup) if existed else None
         journal = TrainingJournal(path)
         if not existed:
-            warning = maybe_backup(path, path.with_name("workout.backup.sqlite3"))
+            warning = maybe_backup(path, backup)
         if warning:
             print(warning, file=sys.stderr)
 
         if args.subcommand == "record":
-            try:
-                command = json.load(sys.stdin)
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                print(f"INVALID_JSON: {error}", file=sys.stderr)
-                return 2
             receipt = journal.record(command, args.request_id, warnings=[warning] if warning else None)
             print_json(receipt)
             return 0
@@ -72,15 +98,17 @@ def main(argv: list[str] | None = None) -> int:
             except CommandError as error:
                 print_json(error.receipt())
                 return 0
-            if args.html:
-                if args.exercise is None:
-                    parser().error("--htmlには--exerciseが必要です。")
-                output = render_progress(progress, args.html)
+            if output_path is not None:
+                try:
+                    output = render_progress(progress, output_path)
+                except OSError as error:
+                    print(f"EXPORT_FAILED: {error}", file=sys.stderr)
+                    return 1
                 print_json({"status": "generated", "path": str(output)})
             else:
                 print_json(progress)
             return 0
-    except StorageUnavailable as error:
+    except (OSError, StorageUnavailable) as error:
         print(f"STORAGE_UNAVAILABLE: {error}", file=sys.stderr)
         print_json({"error": {"code": "STORAGE_UNAVAILABLE"}})
         return 1

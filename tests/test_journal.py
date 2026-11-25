@@ -4,13 +4,16 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import closing
 from pathlib import Path
 
-from workout_tracker.journal import SCHEMA, CommandError, TrainingJournal, maybe_backup
+from workout_tracker.journal import SCHEMA, TrainingJournal, maybe_backup
 from workout_tracker.render import render_progress
 
 
@@ -317,9 +320,8 @@ class JournalTests(unittest.TestCase):
         con.close()
 
         migrated = TrainingJournal(legacy_db, clock=lambda: self.now)
-        preserved = (
-            sqlite3.connect(legacy_db).execute("SELECT weight_kg, reps FROM set_performances WHERE id = 1").fetchone()
-        )
+        with closing(sqlite3.connect(legacy_db)) as con:
+            preserved = con.execute("SELECT weight_kg, reps FROM set_performances WHERE id = 1").fetchone()
         migrated.record(
             {
                 "type": "register_exercise",
@@ -357,6 +359,68 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(result["error"]["code"], "INVALID_VALUE")
         self.assertEqual(self.rows("SELECT * FROM set_performances"), [])
 
+    def test_out_of_range_numbers_return_invalid_value(self) -> None:
+        self.register()
+        cases = (
+            ("weight_kg", self.add(weight=10**400)),
+            ("target_set_id", self.journal.record(
+                {"type": "void_set", "target_set_id": 2**63, "source_text": "取消"},
+                self.request_id(),
+            )),
+        )
+        for field, receipt in cases:
+            with self.subTest(field=field):
+                self.assertEqual(receipt["error"], {"code": "INVALID_VALUE", "field": field})
+
+    def test_explicit_null_performed_at_is_invalid(self) -> None:
+        self.register()
+        receipt = self.journal.record(
+            {
+                "type": "add_set", "exercise": "ベンチプレス", "weight_kg": 60, "reps": 10,
+                "performed_at": None, "source_text": "ベンチプレス60キロ10回",
+            },
+            self.request_id(),
+        )
+        self.assertEqual(receipt.get("error"), {"code": "INVALID_VALUE", "field": "performed_at"})
+
+    def test_utc_out_of_range_performed_at_cannot_be_added_or_corrected(self) -> None:
+        self.register()
+        expected = {"code": "INVALID_VALUE", "field": "performed_at"}
+        invalid_times = ("0001-01-01T00:00:00+09:00", "9999-12-31T23:59:59-09:00")
+        for performed_at in invalid_times:
+            with self.subTest(operation="add", performed_at=performed_at):
+                self.assertEqual(self.add(performed_at=performed_at).get("error"), expected)
+        self.assertEqual(self.journal.get_progress("ベンチプレス")["points"], [])
+
+        original = self.add()
+        for performed_at in invalid_times:
+            with self.subTest(operation="correct", performed_at=performed_at):
+                receipt = self.journal.record(
+                    {
+                        "type": "correct_set", "target_set_id": original["set_id"],
+                        "changes": {"performed_at": performed_at}, "source_text": "実施時刻の訂正",
+                    },
+                    self.request_id(),
+                )
+                self.assertEqual(receipt.get("error"), expected)
+        current = self.journal.get_training_context()["current_training"]["sets"]
+        self.assertEqual([item["set_id"] for item in current], [original["set_id"]])
+        self.assertEqual(len(self.journal.get_progress("ベンチプレス")["points"]), 1)
+
+    def test_previously_saved_out_of_range_time_is_still_readable(self) -> None:
+        self.register()
+        recorded = self.add()
+        with closing(sqlite3.connect(self.db)) as con, con:
+            con.execute(
+                "UPDATE set_performances SET performed_at = ? WHERE id = ?",
+                ("0001-01-01T00:00:00+09:00", recorded["set_id"]),
+            )
+        context = self.journal.get_training_context()
+        self.assertEqual(context["exercises"][0]["recent_trainings"][0]["sets"][0]["set_id"], recorded["set_id"])
+        points = self.journal.get_progress("ベンチプレス")["points"]
+        self.assertEqual([point["date"] for point in points], ["0001-01-01"])
+        self.assertEqual(self.add()["status"], "recorded")
+
 
 class BackupAndRenderTests(unittest.TestCase):
     def test_backup_copies_database_and_skips_fresh_file(self) -> None:
@@ -364,6 +428,7 @@ class BackupAndRenderTests(unittest.TestCase):
             source = Path(directory) / "source.sqlite3"
             backup = Path(directory) / "backup.sqlite3"
             con = sqlite3.connect(source)
+            self.assertEqual(con.execute("PRAGMA journal_mode = WAL").fetchone(), ("wal",))
             con.execute("CREATE TABLE sample(value TEXT)")
             con.execute("INSERT INTO sample VALUES ('saved')")
             con.commit()
@@ -372,9 +437,17 @@ class BackupAndRenderTests(unittest.TestCase):
             self.assertIsNone(maybe_backup(source, backup, now=2_000_000_000))
             first_mtime = backup.stat().st_mtime
             self.assertIsNone(maybe_backup(source, backup, now=first_mtime + 60))
-            copied = sqlite3.connect(backup).execute("SELECT value FROM sample").fetchone()[0]
+            self.assertFalse(Path(f"{backup}-wal").exists())
+            with closing(sqlite3.connect(backup)) as con:
+                copied = con.execute("SELECT value FROM sample").fetchone()[0]
             self.assertEqual(copied, "saved")
             self.assertEqual(backup.stat().st_mtime, first_mtime)
+
+            with closing(sqlite3.connect(source)) as con, con:
+                con.execute("UPDATE sample SET value = 'updated'")
+            self.assertIsNone(maybe_backup(source, backup, now=first_mtime + 25 * 60 * 60))
+            with closing(sqlite3.connect(backup)) as con:
+                self.assertEqual(con.execute("SELECT value FROM sample").fetchone(), ("updated",))
 
     def test_backup_failure_returns_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -385,6 +458,42 @@ class BackupAndRenderTests(unittest.TestCase):
             warning = maybe_backup(source, blocker / "backup.sqlite3")
             self.assertIsNotNone(warning)
             self.assertTrue(warning.startswith("BACKUP_FAILED:"))
+
+    def test_backup_refuses_replacement_while_its_wal_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.sqlite3"
+            backup = Path(directory) / "backup.sqlite3"
+            with closing(sqlite3.connect(source)) as con:
+                con.execute("CREATE TABLE sample(value TEXT)")
+            self.assertIsNone(maybe_backup(source, backup))
+            with closing(sqlite3.connect(backup)) as con:
+                self.assertEqual(con.execute("PRAGMA journal_mode = WAL").fetchone(), ("wal",))
+                with con:
+                    con.execute("INSERT INTO sample VALUES ('restored')")
+                wal = Path(f"{backup}-wal")
+                original = backup.read_bytes(), wal.read_bytes()
+                warning = maybe_backup(source, backup, now=backup.stat().st_mtime + 25 * 60 * 60)
+                self.assertTrue(warning and warning.startswith("BACKUP_FAILED:"))
+                self.assertEqual((backup.read_bytes(), wal.read_bytes()), original)
+
+    def test_backup_returns_warning_while_database_is_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.sqlite3"
+            backup = Path(directory) / "backup.sqlite3"
+            with closing(sqlite3.connect(source)) as con:
+                con.execute("CREATE TABLE sample(value TEXT)")
+                con.execute("BEGIN EXCLUSIVE")
+                result = subprocess.run(
+                    [
+                        sys.executable, "-c",
+                        "import sys; from workout_tracker.journal import maybe_backup;"
+                        " print(maybe_backup(*sys.argv[1:]))",
+                        str(source), str(backup),
+                    ],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+            self.assertTrue(result.stdout.startswith("BACKUP_FAILED:"))
+            self.assertFalse(backup.exists())
 
     def test_render_creates_mobile_html_without_external_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -424,55 +533,194 @@ class BackupAndRenderTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_cli_record_and_context_return_one_json_object(self) -> None:
-        project = Path(__file__).resolve().parents[1]
+    def run_workout(
+        self, db: Path, *args: str, command: dict | str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        stdin = json.dumps(command) if isinstance(command, dict) else command
+        return subprocess.run(
+            [sys.executable, "-m", "workout_tracker", *args],
+            input=stdin,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "WORKOUT_DB_PATH": str(db)},
+        )
+
+    def test_databases_in_one_directory_have_separate_backups(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env = os.environ.copy()
-            env["WORKOUT_DB_PATH"] = str(Path(directory) / "workout.sqlite3")
-            register = subprocess.run(
-                [str(project / "bin" / "workout"), "record", "--request-id", str(uuid.uuid4())],
-                input=json.dumps(
-                    {
-                        "type": "register_exercise",
-                        "name": "ベンチプレス",
-                        "aliases": ["ベンチ"],
-                        "source_text": "登録して",
-                    }
-                ),
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
+            for name in ("first", "second"):
+                db = Path(directory) / f"{name}.sqlite3"
+                TrainingJournal(db).record(
+                    {"type": "register_exercise", "name": name, "source_text": "種目登録"},
+                    str(uuid.uuid4()),
+                )
+                result = self.run_workout(db, "context", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                backup = db.with_name(f"{name}.backup.sqlite3")
+                self.assertTrue(backup.is_file())
+                self.assertEqual(TrainingJournal(backup).get_progress(), {"exercises": [name]})
+
+    def test_backup_refuses_to_replace_unrecognized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "workout.sqlite3"
+            TrainingJournal(db)
+            backup = db.with_name("workout.backup.sqlite3")
+            TrainingJournal(backup).record(
+                {"type": "register_exercise", "name": "別の種目", "source_text": "種目登録"},
+                str(uuid.uuid4()),
+            )
+            for original in (backup.read_bytes(), b"unrecognized data"):
+                with self.subTest(size=len(original)):
+                    backup.write_bytes(original)
+                    os.utime(backup, (1, 1))
+                    result = self.run_workout(db, "context", "--json")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("BACKUP_FAILED", result.stderr)
+                    self.assertEqual(backup.read_bytes(), original)
+                    self.assertEqual(backup.stat().st_mtime, 1)
+
+    def test_backup_keeps_previous_database_when_source_is_replaced(self) -> None:
+        for replacement_kind in ("rename", "overwrite", "copied_db"):
+            with self.subTest(replacement_kind=replacement_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                db = root / "workout.sqlite3"
+                replacement = root / "replacement.sqlite3"
+                TrainingJournal(db).record(
+                    {"type": "register_exercise", "name": "元の種目", "source_text": "種目登録"},
+                    str(uuid.uuid4()),
+                )
+                self.run_workout(db, "context", "--json").check_returncode()
+                backup = root / "workout.backup.sqlite3"
+                original = backup.read_bytes()
+                original_inode = db.stat().st_ino
+                expected_exercises = {"別の種目"}
+                if replacement_kind == "copied_db":
+                    replacement.write_bytes(db.read_bytes())
+                    expected_exercises.add("元の種目")
+                TrainingJournal(replacement).record(
+                    {"type": "register_exercise", "name": "別の種目", "source_text": "種目登録"},
+                    str(uuid.uuid4()),
+                )
+                if replacement_kind == "overwrite":
+                    db.write_bytes(replacement.read_bytes())
+                else:
+                    replacement.replace(db)
+                self.assertEqual(db.stat().st_ino != original_inode, replacement_kind != "overwrite")
+
+                for age in (0, 25 * 60 * 60):
+                    with self.subTest(age=age):
+                        timestamp = backup.stat().st_mtime - age
+                        os.utime(backup, (timestamp, timestamp))
+                        before = backup.stat().st_mtime_ns
+                        result = self.run_workout(db, "progress", "--json")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(set(json.loads(result.stdout)["exercises"]), expected_exercises)
+                        self.assertEqual(
+                            ("BACKUP_FAILED" in result.stderr, backup.read_bytes() == original,
+                             backup.stat().st_mtime_ns == before),
+                            (True, True, True),
+                        )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file permissions")
+    def test_new_database_and_backup_are_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "workout.sqlite3"
+            result = self.run_workout(db, "context", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path in (db, db.with_name("workout.backup.sqlite3")):
+                with self.subTest(path=path.name):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)
+
+    def test_html_export_cannot_overwrite_database_or_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "workout.sqlite3"
+            self.run_workout(db, "context", "--json").check_returncode()
+            self.run_workout(
+                db, "record", "--request-id", str(uuid.uuid4()),
+                command={"type": "register_exercise", "name": "ベンチプレス", "source_text": "種目登録"},
+            ).check_returncode()
+            backup = root / "workout.backup.sqlite3"
+            for path in (db, backup):
+                with self.subTest(path=path.name):
+                    before = path.read_bytes()
+                    result = self.run_workout(db, "progress", "--exercise", "ベンチプレス", "--html", str(path))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_html_export_cannot_overwrite_live_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "workout.sqlite3"
+            self.run_workout(
+                db, "record", "--request-id", str(uuid.uuid4()),
+                command={"type": "register_exercise", "name": "ベンチプレス", "source_text": "種目登録"},
+            ).check_returncode()
+            backup = db.with_name("workout.backup.sqlite3")
+            for database in (db, backup):
+                with closing(sqlite3.connect(database)) as con:
+                    self.assertEqual(con.execute("PRAGMA journal_mode = WAL").fetchone(), ("wal",))
+                    con.execute("CREATE TABLE wal_fixture (value TEXT)")
+                    for suffix in ("-wal", "-shm"):
+                        path = Path(f"{database}{suffix}")
+                        with self.subTest(path=path.name):
+                            before = path.read_bytes()
+                            self.assertTrue(before)
+                            result = self.run_workout(
+                                db, "progress", "--exercise", "ベンチプレス", "--html", str(path),
+                            )
+                            self.assertEqual(result.returncode, 2, result.stderr)
+                            self.assertEqual(path.read_bytes(), before)
+
+    def test_unpaired_unicode_surrogate_returns_invalid_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_workout(
+                Path(directory) / "workout.sqlite3", "record", "--request-id", str(uuid.uuid4()),
+                command={"type": "register_exercise", "name": "ベンチプレス", "source_text": "\ud800"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["error"]["code"], "INVALID_VALUE")
+
+    def test_unreadable_json_returns_usage_error_without_creating_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "workout.sqlite3"
+            for malformed in ("{", "9" * 5000):
+                with self.subTest(length=len(malformed)):
+                    result = self.run_workout(
+                        db, "record", "--request-id", str(uuid.uuid4()), command=malformed,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("INVALID_JSON", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertFalse(db.exists())
+
+    def test_cli_record_and_context_return_one_json_object(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "workout.sqlite3"
+            register = self.run_workout(
+                db, "record", "--request-id", str(uuid.uuid4()),
+                command={
+                    "type": "register_exercise",
+                    "name": "ベンチプレス",
+                    "aliases": ["ベンチ"],
+                    "source_text": "登録して",
+                },
             )
             self.assertEqual(register.returncode, 0, register.stderr)
             self.assertEqual(json.loads(register.stdout)["status"], "recorded")
 
-            record = subprocess.run(
-                [str(project / "bin" / "workout"), "record", "--request-id", str(uuid.uuid4())],
-                input=json.dumps(
-                    {
-                        "type": "add_set",
-                        "exercise": "ベンチ",
-                        "weight_kg": 60,
-                        "reps": 10,
-                        "source_text": "ベンチ60キロ10回",
-                    }
-                ),
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
+            record = self.run_workout(
+                db, "record", "--request-id", str(uuid.uuid4()),
+                command={
+                    "type": "add_set",
+                    "exercise": "ベンチ",
+                    "weight_kg": 60,
+                    "reps": 10,
+                    "source_text": "ベンチ60キロ10回",
+                },
             )
             self.assertEqual(record.returncode, 0, record.stderr)
             self.assertEqual(json.loads(record.stdout)["normalized_set"]["reps"], 10)
 
-            context = subprocess.run(
-                [str(project / "bin" / "workout"), "context", "--json"],
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
+            context = self.run_workout(db, "context", "--json")
             self.assertEqual(context.returncode, 0, context.stderr)
             self.assertEqual(len(json.loads(context.stdout)["current_training"]["sets"]), 1)
 

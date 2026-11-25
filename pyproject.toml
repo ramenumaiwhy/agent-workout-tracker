@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,6 +17,9 @@ Repository = "https://github.com/ramenumaiwhy/agent-workout-tracker"
 
 [project.scripts]
 workout = "workout_tracker.cli:main"
+
+[tool.uv]
+build-constraint-dependencies = ["setuptools==84.2.1"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

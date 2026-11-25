@@ -29,7 +29,7 @@ AIエージェント: 直前のセット実績を、60kg、9回へ訂正しま�
 AIエージェント: 直前のセット実績を取り消しました。
 ```
 
-トレーニングの開始操作と終了操作はありません。最初のセット実績がトレーニングを自動で開始します。4時間以上の空きがある場合は、次のセット実績を新しいトレーニングへ入れます。
+トレーニングの開始操作と終了操作はありません。最初のセット実績がトレーニングを自動で開始します。実施時刻がどの有効なセット実績からも4時間を超えて離れている場合は、新しいトレーニングへ入れます。
 
 ## 全体構造
 
@@ -156,7 +156,7 @@ workout progress --exercise <正式名> --html <出力先>
 
 CLIは標準出力へJSONを1件だけ返します。診断情報は標準エラー出力へ返します。正常な`receipt`を返せた場合は、`recorded`と`not_recorded`のどちらでも終了code 0です。CLI又は保存先が動かず`receipt`を返せない場合だけ0以外にします。
 
-`--html`は同じ`getProgress`の結果からHTMLとinline SVGを作ります。筋トレ記録moduleの操作は増やしません。作成したファイルの絶対pathをJSONで返します。公開URLへの変換は実行環境の責務です。
+`--html`は同じ`getProgress`の結果からHTMLとinline SVGを作ります。作成したファイルの絶対pathをJSONで返します。DB、バックアップ、SQLiteの付随ファイルを指す出力先は拒否します。公開URLへの変換は実行環境の責務です。
 
 ## AIエージェントの責務
 
@@ -201,7 +201,7 @@ AIエージェントは次を行います。
 - 種目の検索keyはUnicode NFKC、前後の空白削除、連続空白の1文字化、Unicode case foldingで正規化します。正式名の表示文字列は変更しません。
 - 正規化後の正式名と別名は全種目で一意です。既存の正式名又は別名と衝突する種目登録は`EXERCISE_CONFLICT`を返します。
 - 数値はJSONの有限なnumberだけを受けます。boolean、`NaN`、無限大は拒否します。重量は小数第3位までを受け、SQLiteの`REAL`へ保存します。
-- 指定する`performed_at`はUTC offset付きISO 8601だけを受けます。省略時の`reported_at`と`performed_at`は、実行中のMacのlocal timezoneとoffsetを使います。
+- 指定する`performed_at`はUTC offset付きISO 8601を使います。保存する秒精度の値をUTCに換算できない場合は、追加・訂正ともに`INVALID_VALUE`を返します。省略時の`reported_at`と`performed_at`は、実行中の環境のlocal timezoneとoffsetを使います。
 
 主なエラーは次のとおりです。
 
@@ -274,7 +274,7 @@ e1RM、総volume、PR判定はMVPへ入れません。
 
 CLI adapter又はSQLiteで失敗した場合、AIエージェントは「記録できませんでした」と返します。会話に利用者の報告が残るため、iPhone側の退避処理は作りません。利用者は障害解消後に同じ報告を再実行できます。
 
-CLI adapterは起動時にbackupファイルの更新時刻を確認します。既存DBはschema移行前にbackupします。ファイルがない場合又は24時間以上経過している場合は、`sqlite3.Connection.backup`で1回保存します。backupは一時ファイルへ作り、完了後に固定名へ置き換えます。backup失敗は現在の記録を止めません。`receipt.warnings`と標準エラー出力へ警告を返します。固定名の更新時刻は成功時だけ変わるため、失敗時は次回のCLI起動で再試行します。常駐処理とbackup管理tableは追加しません。セット実績は後から正確に再生成できないためです。
+CLI adapterは起動時にバックアップ先を確認します。バックアップが必要な既存DBはschema移行前にコピーします。バックアップが存在しない場合、又は同じDBのバックアップと確認でき、前回の作成から24時間以上経っている場合は、`sqlite3.Connection.backup`で一時ファイルにコピーし、完了後に保存します。別DBや由来を確認できないファイルがある場合は、そのファイルを保持して警告を返します。新しく作るDBとバックアップはPOSIX環境で所有者だけが読み書きできます。バックアップのコピーが5秒以内に終わらなければ打ち切り、失敗時は`receipt.warnings`と標準エラー出力に警告を返します。前回のバックアップは残り、次回のCLI起動で再試行します。
 
 ## 既存の食事記録から使う考え方
 
@@ -285,7 +285,7 @@ CLI adapterは起動時にbackupファイルの更新時刻を確認します。
 - 人向け表示は保存データから作る。
 - AIエージェントへDB schemaを公開しない。
 
-筋トレ記録は食事記録と別DBにします。既定の保存先は`~/.local/share/workout-tracker/workout.sqlite3`です。試験と移行時だけ`WORKOUT_DB_PATH`で上書きできます。backupは同じdirectoryの`workout.backup.sqlite3`へ保存します。食事記録と障害及び変更の影響を分けます。
+筋トレ記録は食事記録と別DBにします。既定の保存先は`~/.local/share/workout-tracker/workout.sqlite3`です。試験と移行時は`WORKOUT_DB_PATH`で保存先を指定できます。バックアップはDBと同じディレクトリに、DB名の拡張子の前へ`.backup`を付けて保存します。拡張子のないDB名では末尾に付けます。既定名のバックアップは`workout.backup.sqlite3`です。
 
 ## MVPに含める範囲
 
